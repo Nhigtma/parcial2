@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Tienda - Login</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="card center-card">
+    <h1>Tienda - Acceso</h1>
+
+    <div id="authArea">
+      <form id="loginForm" class="form">
+        <h2>Iniciar sesión</h2>
+        <input id="loginEmail" type="email" placeholder="Correo" required>
+        <input id="loginPassword" type="password" placeholder="Contraseña" required>
+        <button type="submit" class="primary">Entrar</button>
+        <p class="small">¿No tienes cuenta? <a href="#" id="showRegister">Regístrate</a></p>
+        <p class="small"><a href="#" id="showResetRequest">¿Olvidaste tu contraseña?</a></p>
+      </form>
+
+      <form id="registerForm" class="form hidden">
+        <h2>Registro</h2>
+        <input id="regName" type="text" placeholder="Nombre" required>
+        <input id="regEmail" type="email" placeholder="Correo" required>
+        <input id="regPassword" type="password" placeholder="Contraseña" required>
+        <button type="submit" class="primary">Crear cuenta</button>
+        <p class="small"><a href="#" id="showLoginFromReg">Volver al login</a></p>
+      </form>
+
+      <form id="resetRequestForm" class="form hidden">
+        <h2>Solicitar restablecimiento</h2>
+        <input id="resetEmail" type="email" placeholder="Correo" required>
+        <button type="submit">Enviar enlace</button>
+        <p class="small"><a href="#" id="showLoginFromReset">Volver al login</a></p>
+      </form>
+
+      <form id="resetForm" class="form hidden">
+        <h2>Restablecer contraseña</h2>
+        <input id="resetTokenEmail" type="email" placeholder="Correo" required>
+        <input id="resetToken" type="text" placeholder="Token (del correo)" required>
+        <input id="resetNewPassword" type="password" placeholder="Nueva contraseña" required>
+        <button type="submit" class="primary">Restablecer</button>
+        <p class="small"><a href="#" id="showLoginFromResetForm">Volver al login</a></p>
+      </form>
+    </div>
+
+    <div id="msg" class="msg hidden"></div>
+  </main>
+
+<script>
+const API_BASE = 'http://localhost:4000'; // <- ajusta si tu backend corre en otra URL:PORT
+
+// UI helpers
+const $ = id => document.getElementById(id);
+const show = el => el.classList.remove('hidden');
+const hide = el => el.classList.add('hidden');
+const msg = (text, success=true) => {
+  const m = $('msg');
+  m.textContent = text; m.className = success ? 'msg success' : 'msg error';
+  show(m);
+  setTimeout(()=> hide(m), 4500);
+};
+
+// nav between forms
+$('showRegister').addEventListener('click', e => { e.preventDefault(); hide($('loginForm')); show($('registerForm')); });
+$('showLoginFromReg').addEventListener('click', e => { e.preventDefault(); show($('loginForm')); hide($('registerForm')); });
+$('showResetRequest').addEventListener('click', e => { e.preventDefault(); hide($('loginForm')); show($('resetRequestForm')); });
+$('showLoginFromReset').addEventListener('click', e => { e.preventDefault(); show($('loginForm')); hide($('resetRequestForm')); });
+$('showLoginFromResetForm').addEventListener('click', e => { e.preventDefault(); show($('loginForm')); hide($('resetForm')); });
+
+// Register
+$('registerForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const name = $('regName').value.trim();
+  const email = $('regEmail').value.trim();
+  const password = $('regPassword').value;
+  try {
+    const res = await fetch(`${API_BASE}/api/auth/register`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ name, email, password })
+    });
+    const j = await res.json();
+    if (!res.ok) throw new Error(j.message || 'Error registro');
+    msg('Registro OK. Inicia sesión.');
+    $('regName').value=''; $('regEmail').value=''; $('regPassword').value='';
+    show($('loginForm')); hide($('registerForm'));
+  } catch (err) { msg(err.message, false); }
+});
+
+// Login
+$('loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const email = $('loginEmail').value.trim();
+  const password = $('loginPassword').value;
+  try {
+    const res = await fetch(`${API_BASE}/api/auth/login`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ email, password })
+    });
+    const j = await res.json();
+    if (!res.ok) throw new Error(j.message || 'Error login');
+    localStorage.setItem('apiToken', j.token);
+    localStorage.setItem('userName', j.user?.name || j.user?.email || '');
+    window.location.href = 'dashboard.html';
+  } catch (err) { msg(err.message, false); }
+});
+
+// Request reset link
+$('resetRequestForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const email = $('resetEmail').value.trim();
+  try {
+    const res = await fetch(`${API_BASE}/api/auth/request-reset`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ email })
+    });
+    const j = await res.json();
+    if (!res.ok) throw new Error(j.message || 'Error');
+    msg(j.message || 'Revisa tu correo (o token devuelto si SMTP no configurado).');
+    // If backend returned token (dev mode), show reset form prefilled
+    if (j.token) {
+      $('resetTokenEmail').value = email;
+      $('resetToken').value = j.token;
+      hide($('resetRequestForm')); show($('resetForm'));
+    }
+  } catch (err) { msg(err.message, false); }
+});
+
+// Reset password (use token)
+$('resetForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const email = $('resetTokenEmail').value.trim();
+  const token = $('resetToken').value.trim();
+  const newPassword = $('resetNewPassword').value;
+  try {
+    const res = await fetch(`${API_BASE}/api/auth/reset-password`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ email, token, newPassword })
+    });
+    const j = await res.json();
+    if (!res.ok) throw new Error(j.message || 'Error');
+    msg('Contraseña restablecida. Inicia sesión.');
+    show($('loginForm')); hide($('resetForm'));
+  } catch (err) { msg(err.message, false); }
+});
+</script>
+</body>
+</html>

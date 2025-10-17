@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Tienda - Panel</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="container-row">
+      <h1 class="title">Inventario</h1>
+      <div>
+        <span id="welcomeUser"></span>
+        <button id="logoutBtn" class="btn-ghost">Salir</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="card">
+      <h2>Registrar producto</h2>
+      <form id="createForm" class="form-grid">
+        <input id="pName" placeholder="Nombre" required>
+        <input id="pPrice" type="number" placeholder="Precio" step="0.01" required>
+        <input id="pStock" type="number" placeholder="Stock" required>
+        <input id="pPhoto" type="file" accept="image/*">
+        <textarea id="pDescription" placeholder="Descripción"></textarea>
+        <div class="actions">
+          <button type="submit" class="primary">Guardar</button>
+          <button type="button" id="clearForm">Limpiar</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>Listado de productos</h2>
+      <div id="productsList" class="grid-list">Cargando...</div>
+    </section>
+
+    <section class="card actions-row">
+      <button id="downloadPdf" class="primary">📄 Descargar reporte PDF</button>
+      <div class="small">* El PDF se genera desde el backend (incluye fotos).</div>
+    </section>
+  </main>
+
+  <!-- Edit modal simple -->
+  <div id="editModal" class="modal hidden">
+    <div class="modal-card">
+      <h3>Editar producto</h3>
+      <form id="editForm" class="form-grid">
+        <input id="editName" placeholder="Nombre" required>
+        <input id="editPrice" type="number" step="0.01" placeholder="Precio" required>
+        <input id="editStock" type="number" placeholder="Stock" required>
+        <input id="editPhoto" type="file" accept="image/*">
+        <textarea id="editDescription" placeholder="Descripción"></textarea>
+        <div class="actions">
+          <button type="submit" class="primary">Actualizar</button>
+          <button type="button" id="cancelEdit">Cancelar</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+<script>
+/* ------------- CONFIG ------------- */
+const API_BASE = 'http://localhost:4000'; // ajusta si tu backend corre en otra URL/PUERTO
+
+/* ------------- HELPERS & SELECTOR SHORTCUTS ------------- */
+function $(id){ return document.getElementById(id); }
+function show(el){ el && el.classList.remove('hidden'); }
+function hide(el){ el && el.classList.add('hidden'); }
+
+async function fetchJson(url, opts = {}) {
+  const token = localStorage.getItem('apiToken');
+  const headers = opts.headers || {};
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  opts.headers = { ...headers };
+  const res = await fetch(url, opts);
+  const text = await res.text();
+  try { return { ok: res.ok, json: text ? JSON.parse(text) : null, status: res.status }; }
+  catch(e) { return { ok: res.ok, text, status: res.status }; }
+}
+
+function fileToDataUrl(file){
+  return new Promise((res, rej) => {
+    const reader = new FileReader();
+    reader.onload = () => res(reader.result);
+    reader.onerror = (e) => rej(e);
+    reader.readAsDataURL(file);
+  });
+}
+
+/* ------------- AUTH CHECK & UI INIT ------------- */
+const token = localStorage.getItem('apiToken');
+if (!token) window.location.href = 'index.html';
+$('welcomeUser').textContent = 'Hola, ' + (localStorage.getItem('userName') || 'Usuario');
+
+/* ------------- PRODUCT LISTING ------------- */
+async function loadProducts(){
+  const r = await fetchJson(API_BASE + '/api/products', { method: 'GET' });
+  const cont = $('productsList');
+  if (!r.ok) {
+    cont.innerHTML = '<div class="small">No se pudieron cargar los productos.</div>';
+    return;
+  }
+  const list = r.json || [];
+  cont.innerHTML = '';
+  // render cards
+  for (const p of list) {
+    // p has fields: id, name, description, price, stock, hasPhoto
+    let imgSrc = '';
+    if (p.hasPhoto) {
+      const pi = await fetchJson(API_BASE + '/api/products/' + encodeURIComponent(p.id), { method: 'GET' });
+      if (pi.ok && pi.json && pi.json.photoBase64) imgSrc = pi.json.photoBase64;
+    }
+    const card = document.createElement('div');
+    card.className = 'product-card';
+    card.innerHTML = `
+      <div class="product-left">
+        <div class="thumb-wrap">${ imgSrc ? `<img src="${imgSrc}" alt="${p.name}" class="thumb">` : '<div class="no-thumb">No foto</div>' }</div>
+      </div>
+      <div class="product-body">
+        <h3>${escapeHtml(p.name)}</h3>
+        <p class="muted">${escapeHtml(p.description || '')}</p>
+        <p><strong>$${Number(p.price).toFixed(2)}</strong> · Stock: <span id="stock-${escapeId(p.id)}">${p.stock}</span></p>
+      </div>
+      <div class="product-actions">
+        <button class="small" data-action="edit" data-id="${encodeURIComponent(p.id)}">Editar</button>
+        <button class="ghost" data-action="delete" data-id="${encodeURIComponent(p.id)}">Eliminar</button>
+        <button class="primary" data-action="buy" data-id="${encodeURIComponent(p.id)}">Comprar</button>
+      </div>
+    `;
+    cont.appendChild(card);
+  }
+
+  // attach handlers
+  cont.querySelectorAll('button').forEach(b => {
+    const action = b.getAttribute('data-action');
+    const id = decodeURIComponent(b.getAttribute('data-id') || '');
+    if (!action || !id) return;
+    b.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      if (action === 'delete') onDelete(id);
+      if (action === 'edit') onEditOpen(id);
+      if (action === 'buy') onBuy(id);
+    });
+  });
+}
+
+/* ------------- CREATE PRODUCT ------------- */
+$('createForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const name = $('pName').value.trim();
+  const price = $('pPrice').value;
+  const stock = $('pStock').value;
+  const description = $('pDescription').value.trim();
+  const file = $('pPhoto').files[0];
+  let payload = { name, price, stock, description };
+  if (file) {
+    payload.photoBase64 = await fileToDataUrl(file);
+    payload.photoMime = file.type;
+  }
+  const r = await fetchJson(API_BASE + '/api/products', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  if (!r.ok) return alert(r.json?.message || r.text || 'Error creando producto');
+  alert('Producto creado');
+  $('createForm').reset();
+  loadProducts();
+});
+
+$('clearForm').addEventListener('click', () => $('createForm').reset());
+
+/* ------------- DELETE ------------- */
+async function onDelete(id){
+  if (!confirm('¿Eliminar producto?')) return;
+  const r = await fetchJson(API_BASE + '/api/products/' + encodeURIComponent(id), { method: 'DELETE' });
+  if (!r.ok) return alert(r.json?.message || 'Error eliminando');
+  alert('Eliminado');
+  loadProducts();
+}
+
+/* ------------- EDIT ------------- */
+async function onEditOpen(id){
+  const r = await fetchJson(API_BASE + '/api/products/' + encodeURIComponent(id), { method: 'GET' });
+  if (!r.ok) return alert('Error al cargar producto');
+  const p = r.json;
+  $('editName').value = p.name || '';
+  $('editPrice').value = p.price || 0;
+  $('editStock').value = p.stock || 0;
+  $('editDescription').value = p.description || '';
+  $('editModal').dataset.editing = id;
+  show($('editModal'));
+}
+
+$('cancelEdit').addEventListener('click', ()=> hide($('editModal')));
+
+$('editForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const id = $('editModal').dataset.editing;
+  const name = $('editName').value.trim();
+  const price = $('editPrice').value;
+  const stock = $('editStock').value;
+  const description = $('editDescription').value.trim();
+  const file = $('editPhoto').files[0];
+  let payload = { name, price, stock, description };
+  if (file) {
+    payload.photoBase64 = await fileToDataUrl(file);
+    payload.photoMime = file.type;
+  }
+  const r = await fetchJson(API_BASE + '/api/products/' + encodeURIComponent(id), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  if (!r.ok) return alert(r.json?.message || 'Error actualizando');
+  alert('Actualizado');
+  hide($('editModal'));
+  loadProducts();
+});
+
+/* ------------- BUY ------------- */
+async function onBuy(id){
+  const qty = prompt('Cantidad a comprar (decrementar stock):', '1');
+  if (!qty) return;
+  const q = parseInt(qty);
+  if (isNaN(q) || q <= 0) return alert('Cantidad inválida');
+  const r = await fetchJson(API_BASE + '/api/products/' + encodeURIComponent(id) + '/buy', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ quantity: q })
+  });
+  if (!r.ok) return alert(r.json?.message || 'Error en compra');
+  alert('Compra registrada. Stock restante: ' + (r.json?.remainingStock ?? 'n/a'));
+  loadProducts();
+}
+
+/* ------------- DOWNLOAD PDF ------------- */
+$('downloadPdf').addEventListener('click', async () => {
+  try {
+    const tokenLocal = localStorage.getItem('apiToken');
+    const res = await fetch(API_BASE + '/api/products/report/pdf', {
+      method: 'GET',
+      headers: { 'Authorization': 'Bearer ' + tokenLocal }
+    });
+    if (!res.ok) return alert('Error generando PDF. Código: ' + res.status);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `inventario.pdf`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (err) { alert('Error: ' + err.message) }
+});
+
+/* ------------- LOGOUT ------------- */
+$('logoutBtn').addEventListener('click', () => {
+  localStorage.removeItem('apiToken');
+  localStorage.removeItem('userName');
+  window.location.href = 'index.html';
+});
+
+/* ------------- UTIL ------------- */
+function escapeHtml(text) {
+  if (!text) return '';
+  return text.replace(/[&<>"']/g, (m) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+function escapeId(id) { return id.replace(/[^a-zA-Z0-9-_:.]/g, '_'); }
+
+/* ------------- INITIAL LOAD ------------- */
+loadProducts();
+</script>
+</body>
+</html>
