@@ -1,5 +1,5 @@
 // server.js -- Backend todo en 1 archivo
-// Requisitos: npm i express dotenv nano bcrypt jsonwebtoken uuid multer nodemailer pdfkit cors
+// Requisitos: npm i express dotenv nano bcrypt jsonwebtoken uuid multer nodemailer pdfkit cors exceljs
 // Uso: copiar .env, llenar, luego: node server.js
 
 const dotenv = require('dotenv');
@@ -12,6 +12,7 @@ const { v4: uuidv4 } = require('uuid');
 const multer = require('multer');
 const nodemailer = require('nodemailer');
 const PDFDocument = require('pdfkit');
+const ExcelJS = require('exceljs');
 
 dotenv.config({path: './.env'});
 
@@ -27,12 +28,16 @@ const upload = multer(); // usaremos multer para recibir photo multipart/form-da
 const COUCH_URL = process.env.COUCH_URL || 'http://admin:admin@127.0.0.1:5984';
 const USERS_DB = process.env.COUCH_DB_USERS || 'users';
 const PRODUCTS_DB = process.env.COUCH_DB_PRODUCTS || 'products';
+const SALES_DB = process.env.COUCH_DB_SALES || 'sales';
+const CUSTOMERS_DB = process.env.COUCH_DB_CUSTOMERS || 'customers';
 const JWT_SECRET = process.env.JWT_SECRET || 'secret_jwt_change_me';
 const APP_BASE_URL = process.env.APP_BASE_URL || 'http://localhost:4000';
 
 const nano = Nano(COUCH_URL);
 let usersDb = null;
 let productsDb = null;
+let salesDb = null;
+let customersDb = null;
 
 async function ensureDB(name) {
   try {
@@ -45,8 +50,12 @@ async function ensureDB(name) {
 async function initDbs() {
   await ensureDB(USERS_DB);
   await ensureDB(PRODUCTS_DB);
+  await ensureDB(SALES_DB);
+  await ensureDB(CUSTOMERS_DB);
   usersDb = nano.db.use(USERS_DB);
   productsDb = nano.db.use(PRODUCTS_DB);
+  salesDb = nano.db.use(SALES_DB);
+  customersDb = nano.db.use(CUSTOMERS_DB);
 }
 initDbs().catch(err => {
   console.error('Error inicializando CouchDB:', err);
@@ -271,7 +280,8 @@ app.get('/api/products', async (req, res) => {
       price: d.price,
       stock: d.stock,
       createdAt: d.createdAt,
-      hasPhoto: !!d.photoBase64
+      hasPhoto: !!d.photoBase64,
+      photoBase64: d.photoBase64 ? `data:${d.photoMime || 'image/jpeg'};base64,${d.photoBase64}` : null
     }));
     return res.json(items);
   } catch (err) {
@@ -346,23 +356,241 @@ app.delete('/api/products/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// Buy product (decrement stock)
-app.post('/api/products/:id/buy', async (req, res) => {
+// --- Customers CRUD ---
+// Create customer
+app.post('/api/customers', async (req, res) => {
   try {
-    const id = req.params.id;
-    const quantity = parseInt(req.body.quantity || 1);
-    if (quantity <= 0) return res.status(400).json({ message: 'Cantidad inválida' });
+    const { name, email, phone, address } = req.body;
+    if (!name) return res.status(400).json({ message: 'Nombre es requerido' });
 
-    const doc = await productsDb.get(id);
-    if (doc.stock === undefined || doc.stock < quantity) return res.status(400).json({ message: 'Stock insuficiente' });
+    const id = `customer:${uuidv4()}`;
+    const customerDoc = {
+      _id: id,
+      name: name.trim(),
+      email: email ? email.trim() : '',
+      phone: phone ? phone.trim() : '',
+      address: address ? address.trim() : '',
+      createdAt: new Date().toISOString()
+    };
 
-    doc.stock = doc.stock - quantity;
-    await productsDb.insert(doc);
-    // opcional: crear un ticket de venta (no solicitado explícitamente)
-    return res.json({ message: 'Compra realizada', remainingStock: doc.stock });
+    await customersDb.insert(customerDoc);
+    return res.status(201).json({ message: 'Cliente creado', id: customerDoc._id, customer: customerDoc });
   } catch (err) {
     console.error(err);
-    return res.status(400).json({ message: 'Error al comprar producto' });
+    return res.status(500).json({ message: 'Error al crear cliente' });
+  }
+});
+
+// Get all customers
+app.get('/api/customers', async (req, res) => {
+  try {
+    const result = await customersDb.find({ selector: {}, limit: 1000 });
+    const items = (result.docs || []).map(d => ({
+      id: d._id,
+      name: d.name,
+      email: d.email,
+      phone: d.phone,
+      address: d.address,
+      createdAt: d.createdAt
+    }));
+    return res.json(items);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Error listando clientes' });
+  }
+});
+
+// Get customer by id
+app.get('/api/customers/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const doc = await customersDb.get(id);
+    return res.json({
+      id: doc._id,
+      name: doc.name,
+      email: doc.email,
+      phone: doc.phone,
+      address: doc.address,
+      createdAt: doc.createdAt
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(404).json({ message: 'Cliente no encontrado' });
+  }
+});
+
+// --- Sales endpoints ---
+// Create sale (buy products and register sale)
+app.post('/api/sales', async (req, res) => {
+  try {
+    const { customerId, customerName, items } = req.body;
+    // items = [ { productId, quantity }, ... ]
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ message: 'Items son requeridos' });
+    }
+
+    // Validar y obtener productos
+    const saleItems = [];
+    let total = 0;
+
+    for (const item of items) {
+      const productId = item.productId;
+      const quantity = parseInt(item.quantity || 1);
+      if (quantity <= 0) return res.status(400).json({ message: 'Cantidad inválida' });
+
+      const productDoc = await productsDb.get(productId);
+      if (productDoc.stock === undefined || productDoc.stock < quantity) {
+        return res.status(400).json({ message: `Stock insuficiente para producto ${productDoc.name}` });
+      }
+
+      const itemTotal = productDoc.price * quantity;
+      saleItems.push({
+        productId: productDoc._id,
+        productName: productDoc.name,
+        quantity,
+        unitPrice: productDoc.price,
+        total: itemTotal
+      });
+      total += itemTotal;
+
+      // Decrementar stock
+      productDoc.stock -= quantity;
+      await productsDb.insert(productDoc);
+    }
+
+    // Crear venta
+    const saleId = `sale:${uuidv4()}`;
+    const saleDoc = {
+      _id: saleId,
+      customerId: customerId || 'guest',
+      customerName: customerName || 'Cliente Anónimo',
+      items: saleItems,
+      total,
+      createdAt: new Date().toISOString()
+    };
+
+    await salesDb.insert(saleDoc);
+    return res.status(201).json({
+      message: 'Venta realizada',
+      saleId: saleDoc._id,
+      total: saleDoc.total
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(400).json({ message: err.message || 'Error al realizar venta' });
+  }
+});
+
+// Get all sales
+app.get('/api/sales', async (req, res) => {
+  try {
+    const result = await salesDb.find({ selector: {}, limit: 1000 });
+    return res.json(result.docs || []);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Error listando ventas' });
+  }
+});
+
+// Get sale by id
+app.get('/api/sales/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const doc = await salesDb.get(id);
+    return res.json(doc);
+  } catch (err) {
+    console.error(err);
+    return res.status(404).json({ message: 'Venta no encontrada' });
+  }
+});
+
+// Generate invoice PDF for a specific sale
+app.get('/api/sales/:id/invoice', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const sale = await salesDb.get(id);
+
+    const doc = new PDFDocument({ margin: 50, size: 'A4' });
+    res.setHeader('Content-Disposition', `attachment; filename="factura_${sale._id}.pdf"`);
+    res.setHeader('Content-Type', 'application/pdf');
+
+    doc.pipe(res);
+
+    // Header
+    doc.fontSize(20).text('FACTURA DE VENTA', { align: 'center' });
+    doc.moveDown();
+    doc.fontSize(10).text(`Factura No: ${sale._id}`, { align: 'right' });
+    doc.text(`Fecha: ${new Date(sale.createdAt).toLocaleString()}`, { align: 'right' });
+    doc.moveDown();
+
+    // Customer info
+    doc.fontSize(12).text('CLIENTE:', { underline: true });
+    doc.fontSize(10).text(`Nombre: ${sale.customerName}`);
+    if (sale.customerId && sale.customerId !== 'guest') {
+      doc.text(`ID: ${sale.customerId}`);
+    }
+    doc.moveDown();
+
+    // Items table header
+    doc.fontSize(12).text('PRODUCTOS:', { underline: true });
+    doc.moveDown(0.5);
+
+    // Items with images
+    doc.font('Helvetica');
+    for (const item of sale.items) {
+      // Try to load product image
+      let productImage = null;
+      try {
+        const product = await productsDb.get(item.productId);
+        if (product.photoBase64) {
+          productImage = Buffer.from(product.photoBase64, 'base64');
+        }
+      } catch (e) {
+        // Product not found or no image
+      }
+
+      const startY = doc.y;
+
+      // Add image if available
+      if (productImage) {
+        try {
+          doc.image(productImage, 50, startY, { width: 60, height: 60 });
+        } catch (imgErr) {
+          console.warn('Error adding image to invoice:', imgErr);
+        }
+      }
+
+      // Product details next to image
+      const textX = productImage ? 120 : 50;
+      doc.fontSize(11).font('Helvetica-Bold').text(item.productName, textX, startY);
+      doc.fontSize(9).font('Helvetica');
+      doc.text(`Cantidad: ${item.quantity}`, textX, startY + 15);
+      doc.text(`Precio unitario: $${item.unitPrice.toFixed(2)}`, textX, startY + 28);
+      doc.text(`Subtotal: $${item.total.toFixed(2)}`, textX, startY + 41);
+
+      // Move down for next item
+      doc.moveDown(productImage ? 4 : 3);
+
+      // Add separator line
+      doc.strokeColor('#e5e7eb').lineWidth(0.5)
+         .moveTo(50, doc.y).lineTo(520, doc.y).stroke();
+      doc.moveDown(0.5);
+    }
+
+    doc.moveDown();
+    doc.strokeColor('#cccccc').lineWidth(1)
+       .moveTo(50, doc.y).lineTo(520, doc.y).stroke();
+    doc.moveDown();
+
+    // Total
+    doc.fontSize(14).font('Helvetica-Bold');
+    doc.text('TOTAL:', 330, doc.y, { width: 80, align: 'right' });
+    doc.text(`$${sale.total.toFixed(2)}`, 420, doc.y, { width: 80, align: 'right' });
+
+    doc.end();
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Error generando factura' });
   }
 });
 
@@ -417,6 +645,248 @@ app.get('/api/products/report/pdf', authMiddleware, async (req, res) => {
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: 'Error generando PDF' });
+  }
+});
+
+// --- Reports in XLSX format ---
+// Report 1: Total sales value
+app.get('/api/reports/sales-total', authMiddleware, async (req, res) => {
+  try {
+    const result = await salesDb.find({ selector: {}, limit: 10000 });
+    const sales = result.docs || [];
+
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Reporte de Ventas');
+
+    // Headers
+    worksheet.columns = [
+      { header: 'ID Venta', key: 'id', width: 30 },
+      { header: 'Cliente', key: 'customer', width: 30 },
+      { header: 'Fecha', key: 'date', width: 20 },
+      { header: 'Total', key: 'total', width: 15 }
+    ];
+
+    // Style headers
+    worksheet.getRow(1).font = { bold: true };
+    worksheet.getRow(1).fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFD3D3D3' }
+    };
+
+    // Add data
+    let totalSales = 0;
+    for (const sale of sales) {
+      worksheet.addRow({
+        id: sale._id,
+        customer: sale.customerName,
+        date: new Date(sale.createdAt).toLocaleString(),
+        total: sale.total
+      });
+      totalSales += sale.total;
+    }
+
+    // Add total row
+    const totalRow = worksheet.addRow({
+      id: '',
+      customer: '',
+      date: 'TOTAL VENTAS:',
+      total: totalSales
+    });
+    totalRow.font = { bold: true };
+    totalRow.getCell('total').fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFFFFF00' }
+    };
+
+    res.setHeader('Content-Disposition', `attachment; filename="reporte_ventas_${new Date().toISOString().slice(0,10)}.xlsx"`);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Error generando reporte de ventas' });
+  }
+});
+
+// Report 2: Total products in stock
+app.get('/api/reports/stock', authMiddleware, async (req, res) => {
+  try {
+    const result = await productsDb.find({ selector: {}, limit: 10000 });
+    const products = result.docs || [];
+
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Reporte de Stock');
+
+    // Headers
+    worksheet.columns = [
+      { header: 'ID Producto', key: 'id', width: 30 },
+      { header: 'Nombre', key: 'name', width: 30 },
+      { header: 'Precio', key: 'price', width: 15 },
+      { header: 'Stock Disponible', key: 'stock', width: 20 },
+      { header: 'Valor Total Stock', key: 'totalValue', width: 20 }
+    ];
+
+    // Style headers
+    worksheet.getRow(1).font = { bold: true };
+    worksheet.getRow(1).fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFD3D3D3' }
+    };
+
+    // Add data
+    let totalStock = 0;
+    let totalValue = 0;
+    for (const product of products) {
+      const stock = product.stock || 0;
+      const value = stock * product.price;
+      worksheet.addRow({
+        id: product._id,
+        name: product.name,
+        price: product.price,
+        stock: stock,
+        totalValue: value
+      });
+      totalStock += stock;
+      totalValue += value;
+    }
+
+    // Add total row
+    const totalRow = worksheet.addRow({
+      id: '',
+      name: '',
+      price: '',
+      stock: totalStock,
+      totalValue: totalValue
+    });
+    totalRow.font = { bold: true };
+    totalRow.getCell('stock').fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFFFFF00' }
+    };
+    totalRow.getCell('totalValue').fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFFFFF00' }
+    };
+
+    res.setHeader('Content-Disposition', `attachment; filename="reporte_stock_${new Date().toISOString().slice(0,10)}.xlsx"`);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Error generando reporte de stock' });
+  }
+});
+
+// Report 3: Total purchases by a single customer
+app.get('/api/reports/customer-purchases/:customerId', authMiddleware, async (req, res) => {
+  try {
+    const customerId = req.params.customerId;
+
+    // Get customer info
+    let customerName = 'Cliente';
+    try {
+      const customer = await customersDb.get(customerId);
+      customerName = customer.name;
+    } catch (e) {
+      // If customer not found, check if it's a name search
+      const result = await customersDb.find({
+        selector: { name: { $regex: `(?i)${customerId}` } },
+        limit: 1
+      });
+      if (result.docs && result.docs.length > 0) {
+        customerName = result.docs[0].name;
+      }
+    }
+
+    // Get all sales for this customer
+    const salesResult = await salesDb.find({
+      selector: {
+        $or: [
+          { customerId: customerId },
+          { customerName: { $regex: `(?i)${customerId}` } }
+        ]
+      },
+      limit: 10000
+    });
+    const sales = salesResult.docs || [];
+
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Compras del Cliente');
+
+    // Title
+    worksheet.mergeCells('A1:E1');
+    const titleCell = worksheet.getCell('A1');
+    titleCell.value = `Compras del Cliente: ${customerName}`;
+    titleCell.font = { bold: true, size: 14 };
+    titleCell.alignment = { horizontal: 'center' };
+
+    // Headers
+    worksheet.getRow(3).values = ['ID Venta', 'Fecha', 'Productos', 'Cantidad Total', 'Total'];
+    worksheet.columns = [
+      { key: 'id', width: 30 },
+      { key: 'date', width: 20 },
+      { key: 'products', width: 40 },
+      { key: 'quantity', width: 15 },
+      { key: 'total', width: 15 }
+    ];
+
+    // Style headers
+    worksheet.getRow(3).font = { bold: true };
+    worksheet.getRow(3).fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFD3D3D3' }
+    };
+
+    // Add data
+    let totalPurchases = 0;
+    let totalQuantity = 0;
+    for (const sale of sales) {
+      const productsStr = sale.items.map(i => `${i.productName} (x${i.quantity})`).join(', ');
+      const qty = sale.items.reduce((sum, i) => sum + i.quantity, 0);
+
+      worksheet.addRow({
+        id: sale._id,
+        date: new Date(sale.createdAt).toLocaleString(),
+        products: productsStr,
+        quantity: qty,
+        total: sale.total
+      });
+      totalPurchases += sale.total;
+      totalQuantity += qty;
+    }
+
+    // Add total row
+    const totalRow = worksheet.addRow({
+      id: '',
+      date: '',
+      products: 'TOTAL:',
+      quantity: totalQuantity,
+      total: totalPurchases
+    });
+    totalRow.font = { bold: true };
+    totalRow.getCell('total').fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFFFFF00' }
+    };
+
+    res.setHeader('Content-Disposition', `attachment; filename="compras_cliente_${customerId}_${new Date().toISOString().slice(0,10)}.xlsx"`);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Error generando reporte de compras del cliente' });
   }
 });
 
